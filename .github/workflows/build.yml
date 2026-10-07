@@ -14,7 +14,6 @@ jobs:
 build:
 runs-on: ubuntu-latest
 
-```
 steps:
   # 1. 拉取源码
   - name: Checkout
@@ -56,4 +55,3 @@ steps:
       name: legado-apk
       path: app/build/outputs/**/*.apk
       if-no-files-found: error
-```

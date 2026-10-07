@@ -1,8 +1,12 @@
 package io.legado.app.data
 
 import android.content.ContentValues
+import android.content.Intent
 import android.database.sqlite.SQLiteDatabase
+import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.Settings
 import android.util.Log
 import androidx.room.AutoMigration
 import androidx.room.Database
@@ -55,10 +59,34 @@ import io.legado.app.data.entities.TxtTocRule
 import io.legado.app.help.DefaultData
 import org.intellij.lang.annotations.Language
 import splitties.init.appCtx
+import java.io.File
 import java.util.Locale
 
+
 val appDb by lazy {
-    Room.databaseBuilder(appCtx, AppDatabase::class.java, AppDatabase.DATABASE_NAME)
+    /*
+     * 在创建 Room 之前先确认外部存储权限。
+     *
+     * Android 11+ 如果没有 MANAGE_EXTERNAL_STORAGE，
+     * 不允许 Room 创建或打开数据库。
+     *
+     * 这样可以避免因为权限不足而错误地回退到内部数据库。
+     */
+    AppDatabase.ensureExternalStorageAccess()
+
+    /*
+     * 第一次启动修改版时：
+     *
+     * 如果外部数据库不存在，而旧的内部数据库存在，
+     * 则先把旧数据库迁移到 /storage/emulated/0/LegadoDB/
+     */
+    AppDatabase.prepareExternalDatabase()
+
+    Room.databaseBuilder(
+        appCtx,
+        AppDatabase::class.java,
+        AppDatabase.DATABASE_PATH
+    )
         .fallbackToDestructiveMigrationFrom(false, 1, 2, 3, 4, 5, 6, 7, 8, 9)
         .addMigrations(*DatabaseMigrations.migrations)
         .allowMainThreadQueries()
@@ -66,14 +94,33 @@ val appDb by lazy {
         .build()
 }
 
+
 @Database(
     version = 89,
     exportSchema = true,
-    entities = [Book::class, BookGroup::class, BookSource::class, BookChapter::class,
-        ReplaceRule::class, SearchBook::class, SearchKeyword::class, Cookie::class,
-        RssSource::class, Bookmark::class, RssArticle::class, RssReadRecord::class,
-        RssStar::class, TxtTocRule::class, ReadRecord::class, HttpTTS::class, Cache::class,
-        RuleSub::class, DictRule::class, KeyboardAssist::class, Server::class],
+    entities = [
+        Book::class,
+        BookGroup::class,
+        BookSource::class,
+        BookChapter::class,
+        ReplaceRule::class,
+        SearchBook::class,
+        SearchKeyword::class,
+        Cookie::class,
+        RssSource::class,
+        Bookmark::class,
+        RssArticle::class,
+        RssReadRecord::class,
+        RssStar::class,
+        TxtTocRule::class,
+        ReadRecord::class,
+        HttpTTS::class,
+        Cache::class,
+        RuleSub::class,
+        DictRule::class,
+        KeyboardAssist::class,
+        Server::class
+    ],
     views = [BookSourcePart::class],
     autoMigrations = [
         AutoMigration(from = 43, to = 44),
@@ -150,105 +197,424 @@ abstract class AppDatabase : RoomDatabase() {
 
     companion object {
 
+        /**
+         * 原来的数据库文件名。
+         *
+         * 内部数据库：
+         * /data/data/io.legado.app/databases/legado.db
+         */
         const val DATABASE_NAME = "legado.db"
+
+        /**
+         * 新的外部数据库目录。
+         *
+         * 最终文件：
+         * /storage/emulated/0/LegadoDB/legado.db
+         */
+        private val DATABASE_DIR = File(
+            Environment.getExternalStorageDirectory(),
+            "LegadoDB"
+        )
+
+        /**
+         * Room 使用的数据库绝对路径。
+         *
+         * Room 官方支持将绝对路径作为 databaseBuilder 的 name。
+         */
+        val DATABASE_PATH = File(
+            DATABASE_DIR,
+            DATABASE_NAME
+        ).absolutePath
 
         const val BOOK_TABLE_NAME = "books"
         const val BOOK_SOURCE_TABLE_NAME = "book_sources"
         const val RSS_SOURCE_TABLE_NAME = "rssSources"
 
-        val dbCallback = object : Callback() {
 
-            override fun onCreate(db: SupportSQLiteDatabase) {
-                // 只在 API 级别 23 (Marshmallow) 及以上版本尝试设置区域设置
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    try {
-                        Log.d("AppDatabaseCallback", "准备 设置 locale for API ${Build.VERSION.SDK_INT}...")
-                        db.setLocale(Locale.CHINESE)
-                        // 在 21 上报错，但无法拦截
-                        Log.d("AppDatabaseCallback", "成功 设置 locale for API ${Build.VERSION.SDK_INT}.")
-                    } catch (e: Exception) {
-                        Log.e("AppDatabaseCallback", "错误 设置 locale in onCreate for API ${Build.VERSION.SDK_INT}", e)
+        /**
+         * 检查 Android 11+ 的 All Files Access。
+         *
+         * 如果没有权限：
+         *
+         * 1. 不允许 Room 创建数据库
+         * 2. 尝试打开系统权限设置页面
+         * 3. 抛出明确异常
+         *
+         * 这样不会因为权限不足而偷偷创建一个错误的内部数据库。
+         */
+        private fun ensureExternalStorageAccess() {
+
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                return
+            }
+
+            if (Environment.isExternalStorageManager()) {
+                return
+            }
+
+            Log.e(
+                "AppDatabase",
+                "没有 MANAGE_EXTERNAL_STORAGE 权限，无法打开外部数据库：$DATABASE_PATH"
+            )
+
+            /*
+             * 尝试直接打开当前应用的“所有文件访问权限”页面。
+             */
+            try {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:${appCtx.packageName}")
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+
+                appCtx.startActivity(intent)
+
+            } catch (e: Exception) {
+
+                Log.e(
+                    "AppDatabase",
+                    "无法打开应用的所有文件访问权限页面，尝试打开通用设置页面",
+                    e
+                )
+
+                try {
+                    val intent = Intent(
+                        Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION
+                    ).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
-                } else {
-                    Log.i("AppDatabaseCallback", "跳过 setLocale for API ${Build.VERSION.SDK_INT} (below M).")
+
+                    appCtx.startActivity(intent)
+
+                } catch (e2: Exception) {
+
+                    Log.e(
+                        "AppDatabase",
+                        "无法打开所有文件访问权限设置页面",
+                        e2
+                    )
                 }
             }
 
+            throw IllegalStateException(
+                "Legado 数据库需要“所有文件访问权限”。\n" +
+                    "请在系统设置中允许 Legado 管理所有文件后重新启动应用。\n" +
+                    "数据库位置：$DATABASE_PATH"
+            )
+        }
+
+
+        /**
+         * 将原来的内部数据库迁移到外部存储。
+         *
+         * 原数据库：
+         * /data/data/io.legado.app/databases/legado.db
+         *
+         * 新数据库：
+         * /storage/emulated/0/LegadoDB/legado.db
+         *
+         * 注意：
+         * 这里不会删除旧数据库。
+         */
+        private fun prepareExternalDatabase() {
+
+            val externalDb = File(DATABASE_PATH)
+
+            /*
+             * 如果外部数据库已经存在，
+             * 说明已经完成迁移，不再重复复制。
+             */
+            if (externalDb.exists()) {
+                Log.d(
+                    "AppDatabase",
+                    "外部数据库已经存在：${externalDb.absolutePath}"
+                )
+                return
+            }
+
+            /*
+             * 创建：
+             *
+             * /storage/emulated/0/LegadoDB/
+             */
+            if (!DATABASE_DIR.exists()) {
+                if (!DATABASE_DIR.mkdirs() && !DATABASE_DIR.exists()) {
+                    throw IllegalStateException(
+                        "无法创建数据库目录：${DATABASE_DIR.absolutePath}"
+                    )
+                }
+            }
+
+            /*
+             * 原来的内部数据库。
+             */
+            val oldDb = appCtx.getDatabasePath(DATABASE_NAME)
+
+            /*
+             * 如果旧数据库不存在，
+             * 就不需要迁移。
+             *
+             * Room 后面会直接创建新的外部数据库。
+             */
+            if (!oldDb.exists()) {
+                Log.d(
+                    "AppDatabase",
+                    "没有发现旧的内部数据库，将直接创建新的外部数据库：$DATABASE_PATH"
+                )
+                return
+            }
+
+            Log.i(
+                "AppDatabase",
+                "发现旧数据库，开始迁移：${oldDb.absolutePath} -> $DATABASE_PATH"
+            )
+
+            try {
+
+                /*
+                 * 复制主数据库文件。
+                 */
+                oldDb.copyTo(
+                    externalDb,
+                    overwrite = false
+                )
+
+                /*
+                 * SQLite WAL 文件。
+                 *
+                 * 如果存在，必须一起复制。
+                 */
+                val oldWal = File("${oldDb.absolutePath}-wal")
+                val externalWal = File("${externalDb.absolutePath}-wal")
+
+                if (oldWal.exists()) {
+                    oldWal.copyTo(
+                        externalWal,
+                        overwrite = false
+                    )
+
+                    Log.i(
+                        "AppDatabase",
+                        "已迁移 WAL 文件：${oldWal.absolutePath}"
+                    )
+                }
+
+                /*
+                 * SQLite SHM 文件。
+                 *
+                 * 如果存在也复制过去。
+                 */
+                val oldShm = File("${oldDb.absolutePath}-shm")
+                val externalShm = File("${externalDb.absolutePath}-shm")
+
+                if (oldShm.exists()) {
+                    oldShm.copyTo(
+                        externalShm,
+                        overwrite = false
+                    )
+
+                    Log.i(
+                        "AppDatabase",
+                        "已迁移 SHM 文件：${oldShm.absolutePath}"
+                    )
+                }
+
+                Log.i(
+                    "AppDatabase",
+                    "数据库迁移成功：${externalDb.absolutePath}"
+                )
+
+            } catch (e: Exception) {
+
+                /*
+                 * 如果迁移失败，为避免留下一个不完整的数据库，
+                 * 删除已经复制出来的外部文件。
+                 *
+                 * 原来的内部数据库完全不动。
+                 */
+                try {
+                    externalDb.delete()
+                    File("${externalDb.absolutePath}-wal").delete()
+                    File("${externalDb.absolutePath}-shm").delete()
+                } catch (cleanupException: Exception) {
+                    Log.e(
+                        "AppDatabase",
+                        "清理失败的外部数据库文件时发生错误",
+                        cleanupException
+                    )
+                }
+
+                Log.e(
+                    "AppDatabase",
+                    "数据库迁移失败，保留原内部数据库",
+                    e
+                )
+
+                throw IllegalStateException(
+                    "Legado 数据库迁移失败。\n" +
+                        "原数据库仍然保留：${oldDb.absolutePath}\n" +
+                        "目标位置：$DATABASE_PATH",
+                    e
+                )
+            }
+        }
+
+
+        val dbCallback = object : Callback() {
+
+            override fun onCreate(db: SupportSQLiteDatabase) {
+
+                // 只在 API 级别 23 (Marshmallow) 及以上版本尝试设置区域设置
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    try {
+                        Log.d(
+                            "AppDatabaseCallback",
+                            "准备 设置 locale for API ${Build.VERSION.SDK_INT}..."
+                        )
+
+                        db.setLocale(Locale.CHINESE)
+
+                        // 在 21 上报错，但无法拦截
+                        Log.d(
+                            "AppDatabaseCallback",
+                            "成功 设置 locale for API ${Build.VERSION.SDK_INT}."
+                        )
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            "AppDatabaseCallback",
+                            "错误 设置 locale in onCreate for API ${Build.VERSION.SDK_INT}",
+                            e
+                        )
+                    }
+
+                } else {
+
+                    Log.i(
+                        "AppDatabaseCallback",
+                        "跳过 setLocale for API ${Build.VERSION.SDK_INT} (below M)."
+                    )
+                }
+            }
+
+
             override fun onOpen(db: SupportSQLiteDatabase) {
+
                 @Language("sql")
                 val insertBookGroupAllSql = """
                     insert into book_groups(groupId, groupName, 'order', show) 
                     select ${BookGroup.IdAll}, '全部', -10, 1
                     where not exists (select * from book_groups where groupId = ${BookGroup.IdAll})
                 """.trimIndent()
+
                 db.execSQL(insertBookGroupAllSql)
+
+
                 @Language("sql")
                 val insertBookGroupLocalSql = """
                     insert into book_groups(groupId, groupName, 'order', enableRefresh, show) 
                     select ${BookGroup.IdLocal}, '本地', -9, 0, 1
                     where not exists (select * from book_groups where groupId = ${BookGroup.IdLocal})
                 """.trimIndent()
+
                 db.execSQL(insertBookGroupLocalSql)
+
+
                 @Language("sql")
                 val insertBookGroupMusicSql = """
                     insert into book_groups(groupId, groupName, 'order', show) 
                     select ${BookGroup.IdAudio}, '音频', -8, 1
                     where not exists (select * from book_groups where groupId = ${BookGroup.IdAudio})
                 """.trimIndent()
+
                 db.execSQL(insertBookGroupMusicSql)
+
+
                 @Language("sql")
                 val insertBookGroupNetNoneGroupSql = """
                     insert into book_groups(groupId, groupName, 'order', show) 
                     select ${BookGroup.IdNetNone}, '网络未分组', -7, 1
                     where not exists (select * from book_groups where groupId = ${BookGroup.IdNetNone})
                 """.trimIndent()
+
                 db.execSQL(insertBookGroupNetNoneGroupSql)
+
+
                 @Language("sql")
                 val insertBookGroupLocalNoneGroupSql = """
                     insert into book_groups(groupId, groupName, 'order', show) 
                     select ${BookGroup.IdLocalNone}, '本地未分组', -6, 0
                     where not exists (select * from book_groups where groupId = ${BookGroup.IdLocalNone})
                 """.trimIndent()
+
                 db.execSQL(insertBookGroupLocalNoneGroupSql)
+
+
                 @Language("sql")
                 val insertBookGroupVideoSql = """
                     insert into book_groups(groupId, groupName, 'order', show) 
                     select ${BookGroup.IdVideo}, '视频', -5, 1
                     where not exists (select * from book_groups where groupId = ${BookGroup.IdVideo})
                     """.trimIndent()
+
                 db.execSQL(insertBookGroupVideoSql)
+
+
                 @Language("sql")
                 val insertBookGroupErrorSql = """
                     insert into book_groups(groupId, groupName, 'order', show) 
                     select ${BookGroup.IdError}, '更新失败', -1, 1
                     where not exists (select * from book_groups where groupId = ${BookGroup.IdError})
                 """.trimIndent()
+
                 db.execSQL(insertBookGroupErrorSql)
+
+
                 @Language("sql")
                 val upBookSourceLoginUiSql =
                     "update book_sources set loginUi = null where loginUi = 'null'"
+
                 db.execSQL(upBookSourceLoginUiSql)
+
+
                 @Language("sql")
                 val upRssSourceLoginUiSql =
                     "update rssSources set loginUi = null where loginUi = 'null'"
+
                 db.execSQL(upRssSourceLoginUiSql)
+
+
                 @Language("sql")
                 val upHttpTtsLoginUiSql =
                     "update httpTTS set loginUi = null where loginUi = 'null'"
+
                 db.execSQL(upHttpTtsLoginUiSql)
+
+
                 @Language("sql")
                 val upHttpTtsConcurrentRateSql =
                     "update httpTTS set concurrentRate = '0' where concurrentRate is null"
+
                 db.execSQL(upHttpTtsConcurrentRateSql)
-                db.query("select * from keyboardAssists order by serialNo").use {
+
+
+                db.query(
+                    "select * from keyboardAssists order by serialNo"
+                ).use {
+
                     if (it.count == 0) {
+
                         DefaultData.keyboardAssists.forEach { keyboardAssist ->
+
                             val contentValues = ContentValues().apply {
                                 put("type", keyboardAssist.type)
                                 put("key", keyboardAssist.key)
                                 put("value", keyboardAssist.value)
                                 put("serialNo", keyboardAssist.serialNo)
                             }
+
                             db.insert(
                                 "keyboardAssists",
                                 SQLiteDatabase.CONFLICT_REPLACE,
@@ -259,7 +625,5 @@ abstract class AppDatabase : RoomDatabase() {
                 }
             }
         }
-
     }
-
 }

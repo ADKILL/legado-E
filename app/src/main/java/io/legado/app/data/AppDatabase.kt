@@ -242,7 +242,7 @@ abstract class AppDatabase : RoomDatabase() {
          *
          * 这样不会因为权限不足而偷偷创建一个错误的内部数据库。
          */
-        private fun ensureExternalStorageAccess() {
+        fun ensureExternalStorageAccess() {
 
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
                 return
@@ -317,7 +317,7 @@ abstract class AppDatabase : RoomDatabase() {
          * 注意：
          * 这里不会删除旧数据库。
          */
-        private fun prepareExternalDatabase() {
+        fun prepareExternalDatabase() {
 
             val externalDb = File(DATABASE_PATH)
 
